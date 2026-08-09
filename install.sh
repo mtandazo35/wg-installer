@@ -1,6 +1,6 @@
 #!/bin/bash
 # ================================================================= #
-#  WIREGUARD PRO INSTALLER - v2 (hardened)                          #
+#  WIREGUARD PRO INSTALLER - v3 (hardened)                          #
 #  Soporte: Ubuntu 24.04/22.04, Debian 13/12                        #
 #  Mejoras: checksums, DNS pre-check, idempotencia, backup iptables,#
 #           FORWARD DROP, non-interactive flags, uninstall.         #
@@ -12,12 +12,12 @@ LOG_FILE="/root/wg-installer.log"
 STATE_DIR="/var/lib/wg-installer"
 BACKUP_DIR="$STATE_DIR/backups"
 
-CADDY_VERSION="2.11.2"
+CADDY_VERSION="2.11.4"
 WGUI_VERSION="0.6.2"
 
 declare -A CADDY_SHA256=(
-  [amd64]="94391dfefe1f278ac8f387ab86162f0e88d87ff97df367f360e51e3cda3df56f"
-  [arm64]="b9d88bec4254d0a98bd415ad60f97f37e4222dec96235c00b442437f5e303a32"
+  [amd64]="527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9"
+  [arm64]="52d42ae12b3462097e9868da6dfed3c9648ae12edd3b3638102312af84cb6904"
 )
 declare -A WGUI_SHA256=(
   [amd64]="2769536c2ef4cc3630b209675167afd5f199f4cc9f9f0d22ce492592dc1dc68d"
@@ -95,7 +95,7 @@ ui_step() {
 
 banner() {
   ui "${UI_GREEN}==============================================================${UI_NC}"
-  ui "${UI_GREEN}   WIREGUARD PRO INSTALLER v2 (hardened)                      ${UI_NC}"
+  ui "${UI_GREEN}   WIREGUARD PRO INSTALLER v3 (hardened)                      ${UI_NC}"
   ui "${UI_GREEN}==============================================================${UI_NC}"
 }
 
@@ -110,7 +110,13 @@ detect_os_ui() {
   ui "${UI_YELLOW}Sistema detectado:${UI_NC} ${os_name} (ID=${os_id}, VER=${os_ver})"
 }
 
-trap 'rc=$?; if [[ $rc -ne 0 ]]; then ui_err "\n${UI_RED}Error durante la operacion.${UI_NC} Revisa: ${UI_YELLOW}${LOG_FILE}${UI_NC}"; fi' ERR
+on_error() {
+  local exit_code=$?
+  if [[ $exit_code -ne 0 ]]; then
+    ui_err "\n${UI_RED}Error durante la operacion.${UI_NC} Revisa: ${UI_YELLOW}${LOG_FILE}${UI_NC}"
+  fi
+}
+trap on_error ERR
 
 [[ $EUID -ne 0 ]] && { ui_err "${UI_RED}Ejecutar como root${UI_NC}"; exit 1; }
 
@@ -122,17 +128,25 @@ do_uninstall() {
   exec >>"$LOG_FILE" 2>&1
 
   systemctl disable --now wg-quick@wg0 wireguard-ui caddy \
-    wg-quick-watcher@wg0.path wg-boot-fix.service 2>/dev/null || true
+    wg-quick-watcher@wg0.path wg-firewall.service wg-health.timer \
+    wg-backup.timer 2>/dev/null || true
 
   rm -f /etc/systemd/system/wireguard-ui.service \
         /etc/systemd/system/caddy.service \
         /etc/systemd/system/wg-quick-watcher@.path \
         /etc/systemd/system/wg-quick-watcher@.service \
-        /etc/systemd/system/wg-boot-fix.service
+        /etc/systemd/system/wg-firewall.service \
+        /etc/systemd/system/wg-health.service \
+        /etc/systemd/system/wg-health.timer \
+        /etc/systemd/system/wg-backup.service \
+        /etc/systemd/system/wg-backup.timer
   systemctl daemon-reload
 
   rm -f /usr/local/bin/caddy /usr/local/bin/wireguard-ui \
-        /usr/local/sbin/wg-postup-inject.sh /usr/local/sbin/wg-boot-fix.sh
+        /usr/local/sbin/wg-config-apply.sh \
+        /usr/local/sbin/wg-firewall.sh \
+        /usr/local/sbin/wg-health-check.sh \
+        /usr/local/sbin/wg-config-backup.sh
   rm -rf /etc/caddy /var/lib/caddy /usr/local/share/wireguard-ui
   rm -f /etc/default/wireguard-ui /etc/wireguard/wg0.conf /etc/sysctl.d/99-vpn.conf
 
@@ -235,12 +249,19 @@ PKGS=(
   curl tar ca-certificates openssl bind9-dnsutils
   iproute2 iptables iptables-persistent
   wireguard wireguard-tools libcap2-bin
+  util-linux unattended-upgrades
 )
 if [[ "$OS_FAMILY" == "debian" ]] && ! systemctl is-active --quiet systemd-resolved; then
   PKGS+=(resolvconf)
 fi
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${PKGS[@]}"
 systemctl enable --now netfilter-persistent >/dev/null 2>&1 || true
+cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 if [[ "$OS_FAMILY" == "ubuntu" ]]; then
   systemctl enable --now systemd-resolved >/dev/null 2>&1 || true
   ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null || true
@@ -399,8 +420,8 @@ cat >/etc/default/wireguard-ui <<EOF
 SESSION_SECRET=$(openssl rand -hex 32)
 WGUI_USERNAME=$WGUI_USERNAME
 WGUI_PASSWORD_HASH=$WGUI_HASH
-WGUI_MANAGE_START=true
-WGUI_MANAGE_RESTART=true
+WGUI_MANAGE_START=false
+WGUI_MANAGE_RESTART=false
 WGUI_SERVER_INTERFACE_ADDRESSES="$WG_FINAL_ADDRS"
 WGUI_DNS="$WGUI_DNS"
 WGUI_ENDPOINT_ADDRESS="$DOMAIN"
@@ -425,49 +446,10 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-ui_step "Configurando inyector PostUp/PostDown"
-cat >/usr/local/sbin/wg-postup-inject.sh <<EOF
-#!/usr/bin/env bash
-set -eEuo pipefail
-IFACE="\$(ip -4 route show default 2>/dev/null | awk '/default/{print \$5; exit}')"
-[[ -z "\$IFACE" ]] && IFACE="${INTERFACE}"
-CFG="/etc/wireguard/\${1}.conf"
-[[ -f "\$CFG" ]] || exit 0
+ui_step "Configurando firewall idempotente"
 
-POST_UP="PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -s 172.30.0.0/24 -o \${IFACE} -j MASQUERADE; ip6tables -A FORWARD -i %i -j ACCEPT; ip6tables -A FORWARD -o %i -j ACCEPT; (ip6tables -t nat -A POSTROUTING -s fd42:42:42::/64 -o \${IFACE} -j MASQUERADE || true)"
-POST_DOWN="PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -s 172.30.0.0/24 -o \${IFACE} -j MASQUERADE; ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -D FORWARD -o %i -j ACCEPT; (ip6tables -t nat -D POSTROUTING -s fd42:42:42::/64 -o \${IFACE} -j MASQUERADE || true)"
-
-TMP="\$(mktemp)"
-awk -v postup="\$POST_UP" -v postdown="\$POST_DOWN" '
-  BEGIN { in_if=0; injected=0 }
-  /^\[Interface\]/ { in_if=1; print; next }
-  /^\[/ && \$0 !~ /^\[Interface\]/ {
-    if (in_if && !injected) { print postup; print postdown; injected=1 }
-    in_if=0; print; next
-  }
-  {
-    if (in_if) {
-      if (\$0 ~ /^PostUp[[:space:]]*=/) next
-      if (\$0 ~ /^PostDown[[:space:]]*=/) next
-    }
-    print
-  }
-  END { if (in_if && !injected) { print postup; print postdown } }
-' "\$CFG" > "\$TMP"
-
-if ! cmp -s "\$CFG" "\$TMP"; then
-  mv "\$TMP" "\$CFG"
-  chmod 600 "\$CFG"
-else
-  rm -f "\$TMP"
-fi
-EOF
-chmod +x /usr/local/sbin/wg-postup-inject.sh
-
-ui_step "Configurando NAT/Forwarding"
-
-iptables-save  > "$BACKUP_DIR/iptables.v4.backup" 2>/dev/null || true
-ip6tables-save > "$BACKUP_DIR/iptables.v6.backup" 2>/dev/null || true
+[[ -f "$BACKUP_DIR/iptables.v4.backup" ]] || iptables-save > "$BACKUP_DIR/iptables.v4.backup" 2>/dev/null || true
+[[ -f "$BACKUP_DIR/iptables.v6.backup" ]] || ip6tables-save > "$BACKUP_DIR/iptables.v6.backup" 2>/dev/null || true
 log_info "Backup iptables: $BACKUP_DIR"
 
 {
@@ -496,6 +478,7 @@ iptables -A INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT
 iptables -A INPUT -p tcp --dport 80 -j ACCEPT
 iptables -A INPUT -p tcp --dport 443 -j ACCEPT
 iptables -A INPUT -p udp --dport 51820 -j ACCEPT
+iptables -P INPUT DROP
 
 if [[ -n "$WG_ADDR_V6" ]]; then
   ip6tables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
@@ -506,13 +489,77 @@ if [[ -n "$WG_ADDR_V6" ]]; then
   ip6tables -A INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
   ip6tables -A INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
   ip6tables -A INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true
+  ip6tables -P INPUT DROP 2>/dev/null || true
   ip6tables -t nat -A POSTROUTING -s fd42:42:42::/64 -o "$INTERFACE" -j MASQUERADE 2>/dev/null || true
 fi
 
 iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 ip6tables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 
-iptables -t nat -A POSTROUTING -s 172.30.0.0/24 -o "$INTERFACE" -j MASQUERADE 2>/dev/null || true
+cat >/etc/default/wg-firewall <<EOF
+WG_INTERFACE=wg0
+WAN_INTERFACE=$INTERFACE
+WG_IPV4_CIDR=172.30.0.0/24
+WG_IPV6_CIDR=fd42:42:42::/64
+ENABLE_IPV6=$HAS_IPV6
+EOF
+chmod 600 /etc/default/wg-firewall
+
+cat >/usr/local/sbin/wg-firewall.sh <<'EOF'
+#!/usr/bin/env bash
+set -eEuo pipefail
+. /etc/default/wg-firewall
+action="${1:-apply}"
+
+delete_all() {
+  local family="$1" table="$2"; shift 2
+  while "$family" -w -t "$table" -C "$@" 2>/dev/null; do
+    "$family" -w -t "$table" -D "$@"
+  done
+}
+
+remove_rules() {
+  delete_all iptables filter FORWARD -i "$WG_INTERFACE" -j ACCEPT
+  delete_all iptables filter FORWARD -o "$WG_INTERFACE" -j ACCEPT
+  delete_all iptables nat POSTROUTING -s "$WG_IPV4_CIDR" -o "$WAN_INTERFACE" -j MASQUERADE
+  if [[ "$ENABLE_IPV6" == 1 ]]; then
+    delete_all ip6tables filter FORWARD -i "$WG_INTERFACE" -j ACCEPT
+    delete_all ip6tables filter FORWARD -o "$WG_INTERFACE" -j ACCEPT
+    delete_all ip6tables nat POSTROUTING -s "$WG_IPV6_CIDR" -o "$WAN_INTERFACE" -j MASQUERADE
+  fi
+}
+
+remove_rules
+if [[ "$action" == apply ]]; then
+  iptables -w -A FORWARD -i "$WG_INTERFACE" -j ACCEPT
+  iptables -w -A FORWARD -o "$WG_INTERFACE" -j ACCEPT
+  iptables -w -t nat -A POSTROUTING -s "$WG_IPV4_CIDR" -o "$WAN_INTERFACE" -j MASQUERADE
+  if [[ "$ENABLE_IPV6" == 1 ]]; then
+    ip6tables -w -A FORWARD -i "$WG_INTERFACE" -j ACCEPT
+    ip6tables -w -A FORWARD -o "$WG_INTERFACE" -j ACCEPT
+    ip6tables -w -t nat -A POSTROUTING -s "$WG_IPV6_CIDR" -o "$WAN_INTERFACE" -j MASQUERADE
+  fi
+fi
+EOF
+chmod 750 /usr/local/sbin/wg-firewall.sh
+
+cat >/etc/systemd/system/wg-firewall.service <<'EOF'
+[Unit]
+Description=Idempotent WireGuard forwarding and NAT
+Wants=network-online.target
+After=network-online.target netfilter-persistent.service
+Before=wg-quick@wg0.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/wg-firewall.sh apply
+ExecReload=/usr/local/sbin/wg-firewall.sh apply
+ExecStop=/usr/local/sbin/wg-firewall.sh remove
+[Install]
+WantedBy=multi-user.target
+EOF
+
+/usr/local/sbin/wg-firewall.sh apply
 netfilter-persistent save >/dev/null 2>&1 || true
 
 cat >/etc/systemd/system/wg-quick-watcher@.path <<'EOF'
@@ -520,54 +567,111 @@ cat >/etc/systemd/system/wg-quick-watcher@.path <<'EOF'
 Description=Watch /etc/wireguard/%i.conf
 [Path]
 PathModified=/etc/wireguard/%i.conf
+Unit=wg-quick-watcher@%i.service
 [Install]
 WantedBy=multi-user.target
 EOF
 
 cat >/etc/systemd/system/wg-quick-watcher@.service <<'EOF'
 [Unit]
-Description=Patch + Restart WireGuard %i
+Description=Validate and apply WireGuard %i configuration
+After=wg-firewall.service
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/wg-postup-inject.sh %i
-ExecStart=/usr/bin/systemctl restart wg-quick@%i.service
+ExecStart=/usr/local/sbin/wg-config-apply.sh %i
 EOF
 
-cat >/usr/local/sbin/wg-boot-fix.sh <<'EOF'
+cat >/usr/local/sbin/wg-config-apply.sh <<'EOF'
 #!/usr/bin/env bash
-set -euo pipefail
-IFACE="$(ip -4 route show default 2>/dev/null | awk '/default/{print $5; exit}')"
-[[ -z "$IFACE" ]] && exit 0
-sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
-for _ in {1..30}; do ip link show wg0 >/dev/null 2>&1 && break; sleep 1; done
-ip link show wg0 >/dev/null 2>&1 || exit 0
-iptables -t nat -C POSTROUTING -s 172.30.0.0/24 -o "$IFACE" -j MASQUERADE 2>/dev/null \
-  || iptables -t nat -A POSTROUTING -s 172.30.0.0/24 -o "$IFACE" -j MASQUERADE
-if ip -6 addr show "$IFACE" scope global | grep -q "inet6 "; then
-  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
-  ip6tables -t nat -C POSTROUTING -s fd42:42:42::/64 -o "$IFACE" -j MASQUERADE 2>/dev/null \
-    || ip6tables -t nat -A POSTROUTING -s fd42:42:42::/64 -o "$IFACE" -j MASQUERADE 2>/dev/null || true
-fi
-netfilter-persistent save >/dev/null 2>&1 || true
+set -eEuo pipefail
+iface="${1:?interface required}"
+cfg="/etc/wireguard/${iface}.conf"
+exec 9>"/run/lock/wg-config-${iface}.lock"
+flock -w 30 9
+sleep 1
+[[ -s "$cfg" ]]
+chmod 600 "$cfg"
+wg-quick strip "$cfg" >/dev/null
+systemctl restart "wg-quick@${iface}.service"
 EOF
-chmod +x /usr/local/sbin/wg-boot-fix.sh
+chmod 750 /usr/local/sbin/wg-config-apply.sh
 
-cat >/etc/systemd/system/wg-boot-fix.service <<'EOF'
+ui_step "Configurando monitoreo y respaldos"
+cat >/usr/local/sbin/wg-health-check.sh <<'EOF'
+#!/usr/bin/env bash
+set -eEuo pipefail
+failed=0
+for unit in wg-quick@wg0 wireguard-ui caddy wg-firewall; do
+  systemctl is-active --quiet "$unit" || { logger -p daemon.err -t wg-health "$unit is not active"; failed=1; }
+done
+ip link show wg0 >/dev/null 2>&1 || { logger -p daemon.err -t wg-health "wg0 is missing"; failed=1; }
+[[ $(df --output=pcent / | tail -1 | tr -dc '0-9') -lt 85 ]] || { logger -p daemon.warning -t wg-health "root filesystem usage is at least 85%"; failed=1; }
+[[ $(iptables -S FORWARD | grep -c -- '-i wg0 -j ACCEPT' || true) -eq 1 ]] || { logger -p daemon.err -t wg-health "unexpected IPv4 forwarding rule count"; failed=1; }
+[[ $(iptables -t nat -S POSTROUTING | grep -c -- '-s 172.30.0.0/24 .* -j MASQUERADE' || true) -eq 1 ]] || { logger -p daemon.err -t wg-health "unexpected IPv4 NAT rule count"; failed=1; }
+exit "$failed"
+EOF
+chmod 750 /usr/local/sbin/wg-health-check.sh
+
+cat >/etc/systemd/system/wg-health.service <<'EOF'
 [Unit]
-Description=Ensure WG NAT/forward after reboot
-Wants=network-online.target
-After=network-online.target wireguard-ui.service
+Description=WireGuard stack health check
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/wg-boot-fix.sh
+ExecStart=/usr/local/sbin/wg-health-check.sh
+EOF
+cat >/etc/systemd/system/wg-health.timer <<'EOF'
+[Unit]
+Description=Run WireGuard health check every five minutes
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
 [Install]
-WantedBy=multi-user.target
+WantedBy=timers.target
+EOF
+
+cat >/usr/local/sbin/wg-config-backup.sh <<'EOF'
+#!/usr/bin/env bash
+set -eEuo pipefail
+dest=/var/backups/wg-installer
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+install -d -m 700 "$dest"
+umask 077
+tar -czf "$dest/config-${stamp}.tar.gz" \
+  /etc/wireguard /etc/default/wireguard-ui /etc/default/wg-firewall \
+  /etc/caddy /etc/iptables /etc/systemd/system/wg-*.service \
+  /etc/systemd/system/wg-*.timer /etc/systemd/system/wg-*.path \
+  /etc/systemd/system/wireguard-ui.service /etc/systemd/system/caddy.service \
+  /usr/local/share/wireguard-ui/db 2>/dev/null
+find "$dest" -type f -name 'config-*.tar.gz' -mtime +14 -delete
+EOF
+chmod 750 /usr/local/sbin/wg-config-backup.sh
+
+cat >/etc/systemd/system/wg-backup.service <<'EOF'
+[Unit]
+Description=Backup WireGuard stack configuration
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wg-config-backup.sh
+EOF
+cat >/etc/systemd/system/wg-backup.timer <<'EOF'
+[Unit]
+Description=Daily WireGuard configuration backup
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+[Install]
+WantedBy=timers.target
 EOF
 
 ui_step "Iniciando servicios"
 systemctl daemon-reload
-systemctl enable --now wireguard-ui caddy wg-quick-watcher@wg0.path wg-boot-fix.service
+systemctl enable --now wireguard-ui caddy wg-firewall.service \
+  wg-quick-watcher@wg0.path wg-health.timer wg-backup.timer
 systemctl enable wg-quick@wg0 >/dev/null 2>&1 || true
+/usr/local/sbin/wg-config-backup.sh
 
 chown -R root:root /usr/local/share/wireguard-ui/db || true
 systemctl restart wireguard-ui
@@ -578,7 +682,7 @@ ui_step "Verificando despliegue"
 sleep 5
 HEALTH=0
 CODE="?"
-for i in 1 2 3 4 5 6 7 8 9 10; do
+for _ in 1 2 3 4 5 6 7 8 9 10; do
   CODE="$(curl -sk -o /dev/null -w '%{http_code}' "https://$DOMAIN/login" --max-time 10 || true)"
   if [[ "$CODE" == "200" || "$CODE" == "302" || "$CODE" == "303" ]]; then
     HEALTH=1

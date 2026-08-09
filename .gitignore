@@ -3,3 +3,4 @@
 *.swp
 *.tmp
 wg-creds.txt
+.deploy/

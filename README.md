@@ -1,4 +1,4 @@
-# wg-installer
+# wg-installer v3
 
 Instalador endurecido de **WireGuard + [WireGuard-UI](https://github.com/ngoduykhanh/wireguard-ui) + Caddy** para Debian 12/13 y Ubuntu 22.04/24.04.
 
@@ -7,14 +7,15 @@ Genera un servidor VPN con panel web administrativo en un único dominio, con TL
 ## Características
 
 - **Supply-chain**: binarios de Caddy y WireGuard-UI verificados con SHA256.
-- **Firewall por defecto DROP** en `FORWARD` + reglas explícitas con conntrack.
+- **Firewall por defecto DROP** en `INPUT` y `FORWARD`, con reglas explícitas y conntrack.
 - **Backup automático** de `iptables` antes de tocar reglas (restaurables con `--uninstall`).
 - **Detección automática** de interfaz por defecto, puerto SSH, soporte IPv6.
 - **Dual-stack**: IPv4 + IPv6 (ULA `fd42:42:42::/64` + NAT66) cuando el server tiene IPv6 global.
 - **Validación previa**: formato de dominio/email y DNS apuntando al servidor antes de pedir cert a Let's Encrypt.
 - **Modo no interactivo** con flags — ideal para CI / automatizaciones.
-- **Idempotente**: re-ejecutar no redescarga binarios si la versión ya está instalada.
-- **Watchers systemd** que re-inyectan `PostUp/PostDown` en `wg0.conf` cada vez que WireGuard-UI lo reescribe.
+- **Idempotente**: el firewall elimina duplicados y deja exactamente una regla por función.
+- **Aplicación segura**: el watcher valida `wg0.conf` antes de reiniciar y no modifica el archivo generado por WireGuard-UI.
+- **Operación automática**: health check cada cinco minutos, respaldos diarios con retención de 14 días y actualizaciones de seguridad automáticas.
 - **Uninstall** restaura iptables previos.
 
 ## Requisitos
@@ -63,7 +64,7 @@ sudo ./install.sh \
 
 | Componente | Versión fijada | Ubicación |
 |---|---|---|
-| Caddy | 2.11.2 | `/usr/local/bin/caddy` |
+| Caddy | 2.11.4 | `/usr/local/bin/caddy` |
 | WireGuard-UI | 0.6.2 | `/usr/local/bin/wireguard-ui` (UI en `127.0.0.1:5000`) |
 | WireGuard | paquete del OS | `wg0` |
 
@@ -72,8 +73,10 @@ Unidades systemd creadas:
 - `caddy.service` — reverse proxy + TLS auto
 - `wireguard-ui.service` — panel web
 - `wg-quick@wg0.service` — interfaz VPN
-- `wg-quick-watcher@wg0.path` + `@.service` — re-inyecta PostUp/PostDown al cambiar `wg0.conf`
-- `wg-boot-fix.service` — asegura NAT/forwarding tras reboot
+- `wg-firewall.service` — mantiene forwarding y NAT sin reglas duplicadas
+- `wg-quick-watcher@wg0.path` + `@.service` — valida y aplica cambios de `wg0.conf`
+- `wg-health.timer` — verifica servicios, interfaz, disco y reglas cada cinco minutos
+- `wg-backup.timer` — crea un respaldo root-only diario y conserva 14 días
 
 ## Red / NAT
 
@@ -99,6 +102,8 @@ Unidades systemd creadas:
 - Headers activos: HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy.
 - `/etc/default/wireguard-ui` con `chmod 600`.
 - Política `FORWARD DROP` con allowlist explícita para `wg0`.
+- Política `INPUT DROP`, preservando SSH, HTTP(S), WireGuard e ICMP.
+- NAT66 limitado exclusivamente al prefijo ULA de WireGuard.
 - **Recomendado**: exponer el panel solo detrás de VPN una vez configurado el primer cliente (quitando 80/443 del firewall o restringiéndolos).
 
 ## Logs y debug
@@ -111,10 +116,15 @@ cat /root/wg-installer.log
 systemctl status wireguard-ui caddy wg-quick@wg0
 journalctl -u wireguard-ui -f
 journalctl -u caddy -f
+journalctl -u wg-health -n 50 --no-pager
 
 # Estado VPN
 wg show wg0
 ip -br a show wg0
+
+# Timers y respaldos
+systemctl list-timers wg-health.timer wg-backup.timer
+ls -lh /var/backups/wg-installer/
 ```
 
 ## Desinstalar
