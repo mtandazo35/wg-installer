@@ -4,6 +4,20 @@ Instalador endurecido de **WireGuard + [WireGuard-UI](https://github.com/ngoduyk
 
 Genera un servidor VPN con panel web administrativo en un único dominio, con TLS automático vía Let's Encrypt.
 
+## ⚡ Quick install (one-liner)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mtandazo35/wg-installer/main/install.sh -o /tmp/wg-install.sh && chmod 700 /tmp/wg-install.sh && sudo /tmp/wg-install.sh
+```
+
+El instalador ejecutará primero el preflight de compatibilidad y, si el VPS es apto, solicitará dominio, usuario, contraseña y correo para TLS.
+
+Para comprobar compatibilidad sin instalar:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mtandazo35/wg-installer/main/install.sh -o /tmp/wg-install.sh && chmod 700 /tmp/wg-install.sh && sudo /tmp/wg-install.sh --preflight-only
+```
+
 ## Características
 
 - **Supply-chain**: binarios de Caddy y WireGuard-UI verificados con SHA256.
@@ -29,7 +43,7 @@ Genera un servidor VPN con panel web administrativo en un único dominio, con TL
 ## Uso rápido (interactivo)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/manolinxxx/wg-installer/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/mtandazo35/wg-installer/main/install.sh -o install.sh
 chmod +x install.sh
 sudo ./install.sh
 ```
