@@ -12,6 +12,7 @@ Genera un servidor VPN con panel web administrativo en un único dominio, con TL
 - **Detección automática** de interfaz por defecto, puerto SSH, soporte IPv6.
 - **Dual-stack**: IPv4 + IPv6 (ULA `fd42:42:42::/64` + NAT66) cuando el server tiene IPv6 global.
 - **Validación previa**: formato de dominio/email y DNS apuntando al servidor antes de pedir cert a Let's Encrypt.
+- **Preflight bloqueante**: identifica OS, versión, arquitectura, virtualización, red, recursos, puertos y gestores de firewall antes de modificar el VPS.
 - **Modo no interactivo** con flags — ideal para CI / automatizaciones.
 - **Idempotente**: el firewall elimina duplicados y deja exactamente una regla por función.
 - **Aplicación segura**: el watcher valida `wg0.conf` antes de reiniciar y no modifica el archivo generado por WireGuard-UI.
@@ -35,6 +36,20 @@ sudo ./install.sh
 
 El script pide dominio, usuario admin, contraseña y correo para Let's Encrypt.
 
+## Validar compatibilidad sin instalar
+
+```bash
+sudo ./install.sh --preflight-only
+```
+
+El resultado será uno de estos:
+
+- `compatible`: puede continuar con el despliegue.
+- `compatible con advertencias`: puede instalar, pero se detectó una instalación previa o recursos limitados.
+- `no compatible`: el instalador se detiene sin modificar el servidor.
+
+El despliegue se bloquea cuando detecta un sistema o arquitectura no soportados, ausencia de `systemd` o ruta IPv4, menos de 1 GiB libre, ejecución dentro de un contenedor, Docker/containerd, UFW/firewalld o conflictos en los puertos requeridos. El mismo preflight se ejecuta automáticamente antes de cada instalación.
+
 ## Uso no interactivo
 
 ```bash
@@ -56,6 +71,7 @@ sudo ./install.sh \
 | `--email <correo>` | Correo para Let's Encrypt |
 | `--ssh-port <puerto>` | Puerto SSH (auto-detectado si se omite) |
 | `--skip-dns-check` | Omitir la verificación DNS previa |
+| `--preflight-only` | Validar el VPS sin instalar ni modificar |
 | `--non-interactive` | Falla si falta algún flag obligatorio |
 | `--uninstall` | Desinstala todo y restaura iptables del backup |
 | `-h / --help` | Muestra ayuda |

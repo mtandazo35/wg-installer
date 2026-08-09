@@ -32,6 +32,7 @@ NON_INTERACTIVE=0
 SKIP_DNS_CHECK=0
 ACTION="install"
 SSH_PORT=""
+PREFLIGHT_ONLY=0
 
 usage() {
   cat <<EOF >&2
@@ -45,6 +46,7 @@ Opciones:
   --email <correo>           Correo para Let's Encrypt
   --ssh-port <puerto>        Puerto SSH (auto-detectado si se omite)
   --skip-dns-check           Omitir verificacion DNS del dominio
+  --preflight-only           Validar compatibilidad sin instalar ni modificar
   --non-interactive          Exige que todos los parametros vengan por flag
   --uninstall                Desinstalar WireGuard + UI + Caddy
   -h | --help                Muestra esta ayuda
@@ -59,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --email) EMAIL="$2"; shift 2 ;;
     --ssh-port) SSH_PORT="$2"; shift 2 ;;
     --skip-dns-check) SKIP_DNS_CHECK=1; shift ;;
+    --preflight-only) PREFLIGHT_ONLY=1; shift ;;
     --non-interactive) NON_INTERACTIVE=1; shift ;;
     --uninstall) ACTION="uninstall"; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -120,8 +123,6 @@ trap on_error ERR
 
 [[ $EUID -ne 0 ]] && { ui_err "${UI_RED}Ejecutar como root${UI_NC}"; exit 1; }
 
-mkdir -p "$STATE_DIR" "$BACKUP_DIR"
-
 do_uninstall() {
   banner
   ui "${UI_YELLOW}Desinstalando...${UI_NC}"
@@ -168,7 +169,113 @@ if [[ "$ACTION" == "uninstall" ]]; then
   do_uninstall
 fi
 
+declare -a PREFLIGHT_ERRORS=()
+declare -a PREFLIGHT_WARNINGS=()
+
+preflight_error() { PREFLIGHT_ERRORS+=("$1"); }
+preflight_warning() { PREFLIGHT_WARNINGS+=("$1"); }
+
+run_preflight() {
+  local os_id="unknown" os_version="unknown" arch="unknown"
+  local available_kb memory_kb listener process_name container_type
+
+  ui "${UI_BLUE}Comprobando compatibilidad del VPS...${UI_NC}"
+
+  if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+    os_id="${ID:-unknown}"
+    os_version="${VERSION_ID:-unknown}"
+  else
+    preflight_error "No existe /etc/os-release; no se puede identificar el sistema."
+  fi
+
+  case "${os_id}:${os_version}" in
+    debian:12|debian:13|ubuntu:22.04|ubuntu:24.04) ;;
+    *) preflight_error "Sistema no soportado: ${os_id} ${os_version}. Usa Debian 12/13 o Ubuntu 22.04/24.04." ;;
+  esac
+
+  arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+  case "$arch" in
+    amd64|arm64|x86_64|aarch64) ;;
+    *) preflight_error "Arquitectura no soportada: ${arch}. Solo amd64 y arm64." ;;
+  esac
+
+  [[ -d /run/systemd/system ]] || preflight_error "systemd no esta activo como gestor del sistema."
+  command -v systemctl >/dev/null || preflight_error "No se encontro systemctl."
+  command -v apt-get >/dev/null || preflight_error "No se encontro apt-get."
+  command -v ip >/dev/null || preflight_error "No se encontro iproute2; no se puede detectar la red."
+
+  if command -v ip >/dev/null && ! ip -4 route show default 2>/dev/null | grep -q '^default'; then
+    preflight_error "No existe una ruta IPv4 predeterminada."
+  fi
+
+  available_kb="$(df -Pk / 2>/dev/null | awk 'NR==2 {print $4}')"
+  [[ "$available_kb" =~ ^[0-9]+$ ]] || available_kb=0
+  (( available_kb >= 1048576 )) || preflight_error "Se requiere al menos 1 GiB libre en /."
+
+  memory_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  [[ "$memory_kb" =~ ^[0-9]+$ ]] || memory_kb=0
+  (( memory_kb >= 524288 )) || preflight_warning "Hay menos de 512 MiB de RAM; el servicio puede funcionar con poca holgura."
+
+  container_type="$(systemd-detect-virt --container 2>/dev/null || true)"
+  if [[ -n "$container_type" && "$container_type" != none ]]; then
+    preflight_error "Entorno contenedorizado detectado (${container_type}); se requiere un VPS/VM con NET_ADMIN y kernel WireGuard."
+  fi
+
+  if systemctl is-active --quiet docker.service 2>/dev/null || systemctl is-active --quiet containerd.service 2>/dev/null; then
+    preflight_error "Docker/containerd esta activo; reconstruir iptables podria interrumpir sus redes."
+  fi
+  if systemctl is-active --quiet ufw.service 2>/dev/null; then
+    preflight_error "UFW esta activo; debe deshabilitarse o integrarse antes del despliegue."
+  fi
+  if systemctl is-active --quiet firewalld.service 2>/dev/null; then
+    preflight_error "firewalld esta activo; debe deshabilitarse o integrarse antes del despliegue."
+  fi
+
+  if command -v ss >/dev/null; then
+    while IFS= read -r listener; do
+      process_name="$(sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<<"$listener")"
+      case "$process_name" in
+        caddy|wireguard-ui|"") ;;
+        *) preflight_error "Puerto web 80/443 ocupado por ${process_name}; Caddy no podra iniciarse." ;;
+      esac
+    done < <(ss -H -lntp '( sport = :80 or sport = :443 )' 2>/dev/null || true)
+
+    listener="$(ss -H -lnup '( sport = :51820 )' 2>/dev/null || true)"
+    if [[ -n "$listener" ]] && ! ip link show wg0 >/dev/null 2>&1; then
+      preflight_error "UDP 51820 ya esta ocupado por otro proceso."
+    fi
+  else
+    preflight_warning "No se encontro ss; los conflictos de puertos se revisaran despues de instalar dependencias."
+  fi
+
+  if [[ -e /etc/wireguard/wg0.conf || -e /etc/caddy/Caddyfile || -e /etc/default/wireguard-ui ]]; then
+    preflight_warning "Se detecto una instalacion previa; se crearan respaldos y se actualizaran sus componentes."
+  fi
+
+  ui "${UI_YELLOW}Sistema:${UI_NC} ${os_id} ${os_version}; arquitectura ${arch}"
+  for listener in "${PREFLIGHT_WARNINGS[@]}"; do ui "${UI_YELLOW}ADVERTENCIA:${UI_NC} $listener"; done
+  for listener in "${PREFLIGHT_ERRORS[@]}"; do ui_err "${UI_RED}NO COMPATIBLE:${UI_NC} $listener"; done
+
+  if (( ${#PREFLIGHT_ERRORS[@]} > 0 )); then
+    ui_err "${UI_RED}Resultado: no se puede desplegar de forma segura.${UI_NC}"
+    return 1
+  fi
+
+  if (( ${#PREFLIGHT_WARNINGS[@]} > 0 )); then
+    ui "${UI_YELLOW}Resultado: compatible con advertencias.${UI_NC}"
+  else
+    ui "${UI_GREEN}Resultado: compatible.${UI_NC}"
+  fi
+}
+
 banner
+run_preflight
+if [[ $PREFLIGHT_ONLY -eq 1 ]]; then
+  exit 0
+fi
+mkdir -p "$STATE_DIR" "$BACKUP_DIR"
+
 detect_os_ui
 ui "=============================================="
 
