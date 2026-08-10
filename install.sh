@@ -632,6 +632,8 @@ remove_rules() {
   if [[ "$ENABLE_IPV6" == 1 ]]; then
     delete_all ip6tables filter FORWARD -i "$WG_INTERFACE" -j ACCEPT
     delete_all ip6tables filter FORWARD -o "$WG_INTERFACE" -j ACCEPT
+    # Migra instalaciones v2: elimina NAT66 global sin CIDR de origen.
+    delete_all ip6tables nat POSTROUTING -o "$WAN_INTERFACE" -j MASQUERADE
     delete_all ip6tables nat POSTROUTING -s "$WG_IPV6_CIDR" -o "$WAN_INTERFACE" -j MASQUERADE
   fi
 }
@@ -715,6 +717,7 @@ ip link show wg0 >/dev/null 2>&1 || { logger -p daemon.err -t wg-health "wg0 is 
 [[ $(df --output=pcent / | tail -1 | tr -dc '0-9') -lt 85 ]] || { logger -p daemon.warning -t wg-health "root filesystem usage is at least 85%"; failed=1; }
 [[ $(iptables -S FORWARD | grep -c -- '-i wg0 -j ACCEPT' || true) -eq 1 ]] || { logger -p daemon.err -t wg-health "unexpected IPv4 forwarding rule count"; failed=1; }
 [[ $(iptables -t nat -S POSTROUTING | grep -c -- '-s 172.30.0.0/24 .* -j MASQUERADE' || true) -eq 1 ]] || { logger -p daemon.err -t wg-health "unexpected IPv4 NAT rule count"; failed=1; }
+[[ $(ip6tables -t nat -S POSTROUTING | grep -c -- "^-A POSTROUTING -o .* -j MASQUERADE$" || true) -eq 0 ]] || { logger -p daemon.err -t wg-health "unsafe legacy NAT66 rule detected"; failed=1; }
 exit "$failed"
 EOF
 chmod 750 /usr/local/sbin/wg-health-check.sh

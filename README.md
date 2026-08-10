@@ -29,6 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/mtandazo35/wg-installer/main/instal
 - **Preflight bloqueante**: identifica OS, versión, arquitectura, virtualización, red, recursos, puertos y gestores de firewall antes de modificar el VPS.
 - **Modo no interactivo** con flags — ideal para CI / automatizaciones.
 - **Idempotente**: el firewall elimina duplicados y deja exactamente una regla por función.
+- **Migración segura**: elimina reglas NAT66 globales creadas por versiones anteriores y las reemplaza por una regla limitada al CIDR de la VPN.
 - **Aplicación segura**: el watcher valida `wg0.conf` antes de reiniciar y no modifica el archivo generado por WireGuard-UI.
 - **Operación automática**: health check cada cinco minutos, respaldos diarios con retención de 14 días y actualizaciones de seguridad automáticas.
 - **Uninstall** restaura iptables previos.
