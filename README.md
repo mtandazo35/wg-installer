@@ -32,6 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/mtandazo35/wg-installer/main/instal
 - **Migración segura**: elimina reglas NAT66 globales creadas por versiones anteriores y las reemplaza por una regla limitada al CIDR de la VPN.
 - **Aplicación segura**: el watcher valida `wg0.conf` antes de reiniciar y no modifica el archivo generado por WireGuard-UI.
 - **Operación automática**: health check cada cinco minutos, respaldos diarios con retención de 14 días y actualizaciones de seguridad automáticas.
+- **ACL Ecuador opcional**: restringe puertos TCP/UDP a prefijos ecuatorianos y actualiza las listas diariamente desde RIPEstat.
 - **Uninstall** restaura iptables previos.
 
 ## Requisitos
@@ -87,6 +88,8 @@ sudo ./install.sh \
 | `--ssh-port <puerto>` | Puerto SSH (auto-detectado si se omite) |
 | `--skip-dns-check` | Omitir la verificación DNS previa |
 | `--preflight-only` | Validar el VPS sin instalar ni modificar |
+| `--ecuador-tcp-ports <csv>` | Permitir estos puertos TCP únicamente desde IPs de Ecuador (máximo 15) |
+| `--ecuador-udp-ports <csv>` | Permitir estos puertos UDP únicamente desde IPs de Ecuador (máximo 15) |
 | `--non-interactive` | Falla si falta algún flag obligatorio |
 | `--uninstall` | Desinstala todo y restaura iptables del backup |
 | `-h / --help` | Muestra ayuda |
@@ -108,6 +111,7 @@ Unidades systemd creadas:
 - `wg-quick-watcher@wg0.path` + `@.service` — valida y aplica cambios de `wg0.conf`
 - `wg-health.timer` — verifica servicios, interfaz, disco y reglas cada cinco minutos
 - `wg-backup.timer` — crea un respaldo root-only diario y conserva 14 días
+- `wg-ecuador-acl.timer` — actualiza diariamente los prefijos de Ecuador
 
 ## Red / NAT
 
@@ -115,6 +119,27 @@ Unidades systemd creadas:
 - VPN IPv6 (si el host tiene IPv6 global): `fd42:42:42::/64` (ULA + NAT66)
 - DNS por defecto para clientes: Cloudflare (`1.1.1.1`, `1.0.0.1`, `2606:4700:4700::1111`, `2606:4700:4700::1001`)
 - Puerto WireGuard: `UDP 51820`
+
+## ACL de direcciones IP de Ecuador
+
+Para limitar servicios concretos a direcciones asignadas a Ecuador:
+
+```bash
+sudo ./install.sh \
+  --ecuador-tcp-ports 22,8443 \
+  --ecuador-udp-ports 9000
+```
+
+El instalador crea los conjuntos atómicos `ecuador_v4` y `ecuador_v6`, descarga los prefijos desde la API Country Resource List de RIPEstat y programa una actualización diaria. Antes de reemplazar la lista activa exige al menos 50 prefijos IPv4 y 10 IPv6; una descarga vacía, incompleta o inválida no reemplaza la última lista válida.
+
+Las reglas solo afectan a los puertos indicados. No incluyas `51820/UDP` salvo que quieras permitir conexiones WireGuard exclusivamente desde Ecuador. La clasificación se basa en asignaciones de los registros regionales, no en la ubicación física exacta de cada usuario; VPN, roaming, CDN o transferencias recientes pueden producir excepciones.
+
+```bash
+systemctl status wg-ecuador-acl.timer
+ipset list ecuador_v4 | head
+ipset list ecuador_v6 | head
+journalctl -u wg-ecuador-acl -n 50 --no-pager
+```
 
 ## Primer arranque
 

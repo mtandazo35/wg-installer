@@ -33,6 +33,8 @@ SKIP_DNS_CHECK=0
 ACTION="install"
 SSH_PORT=""
 PREFLIGHT_ONLY=0
+ECUADOR_TCP_PORTS=""
+ECUADOR_UDP_PORTS=""
 
 usage() {
   cat <<EOF >&2
@@ -47,6 +49,8 @@ Opciones:
   --ssh-port <puerto>        Puerto SSH (auto-detectado si se omite)
   --skip-dns-check           Omitir verificacion DNS del dominio
   --preflight-only           Validar compatibilidad sin instalar ni modificar
+  --ecuador-tcp-ports <csv>  Restringir estos puertos TCP a IPs de Ecuador
+  --ecuador-udp-ports <csv>  Restringir estos puertos UDP a IPs de Ecuador
   --non-interactive          Exige que todos los parametros vengan por flag
   --uninstall                Desinstalar WireGuard + UI + Caddy
   -h | --help                Muestra esta ayuda
@@ -62,6 +66,8 @@ while [[ $# -gt 0 ]]; do
     --ssh-port) SSH_PORT="$2"; shift 2 ;;
     --skip-dns-check) SKIP_DNS_CHECK=1; shift ;;
     --preflight-only) PREFLIGHT_ONLY=1; shift ;;
+    --ecuador-tcp-ports) ECUADOR_TCP_PORTS="$2"; shift 2 ;;
+    --ecuador-udp-ports) ECUADOR_UDP_PORTS="$2"; shift 2 ;;
     --non-interactive) NON_INTERACTIVE=1; shift ;;
     --uninstall) ACTION="uninstall"; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -130,7 +136,7 @@ do_uninstall() {
 
   systemctl disable --now wg-quick@wg0 wireguard-ui caddy \
     wg-quick-watcher@wg0.path wg-firewall.service wg-health.timer \
-    wg-backup.timer 2>/dev/null || true
+    wg-backup.timer wg-ecuador-acl.timer wg-ecuador-acl-sets.service 2>/dev/null || true
 
   rm -f /etc/systemd/system/wireguard-ui.service \
         /etc/systemd/system/caddy.service \
@@ -140,16 +146,21 @@ do_uninstall() {
         /etc/systemd/system/wg-health.service \
         /etc/systemd/system/wg-health.timer \
         /etc/systemd/system/wg-backup.service \
-        /etc/systemd/system/wg-backup.timer
+        /etc/systemd/system/wg-backup.timer \
+        /etc/systemd/system/wg-ecuador-acl.service \
+        /etc/systemd/system/wg-ecuador-acl.timer \
+        /etc/systemd/system/wg-ecuador-acl-sets.service
   systemctl daemon-reload
 
   rm -f /usr/local/bin/caddy /usr/local/bin/wireguard-ui \
         /usr/local/sbin/wg-config-apply.sh \
         /usr/local/sbin/wg-firewall.sh \
         /usr/local/sbin/wg-health-check.sh \
-        /usr/local/sbin/wg-config-backup.sh
+        /usr/local/sbin/wg-config-backup.sh \
+        /usr/local/sbin/wg-ecuador-acl.sh
   rm -rf /etc/caddy /var/lib/caddy /usr/local/share/wireguard-ui
-  rm -f /etc/default/wireguard-ui /etc/wireguard/wg0.conf /etc/sysctl.d/99-vpn.conf
+  rm -f /etc/default/wireguard-ui /etc/default/wg-firewall \
+        /etc/default/wg-ecuador-acl /etc/wireguard/wg0.conf /etc/sysctl.d/99-vpn.conf
 
   if [[ -f "$BACKUP_DIR/iptables.v4.backup" ]]; then
     iptables-restore < "$BACKUP_DIR/iptables.v4.backup" || true
@@ -161,6 +172,8 @@ do_uninstall() {
   fi
 
   netfilter-persistent save >/dev/null 2>&1 || true
+  ipset destroy ecuador_v4 2>/dev/null || true
+  ipset destroy ecuador_v6 2>/dev/null || true
   ui "${UI_GREEN}Desinstalacion completada.${UI_NC}"
   exit 0
 }
@@ -287,6 +300,18 @@ validate_email() {
   [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
 }
 
+validate_port_list() {
+  local value="$1" item count=0
+  [[ -z "$value" ]] && return 0
+  [[ "$value" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+  IFS=',' read -ra items <<<"$value"
+  for item in "${items[@]}"; do
+    (( item >= 1 && item <= 65535 )) || return 1
+    count=$((count + 1))
+  done
+  (( count <= 15 ))
+}
+
 if [[ $NON_INTERACTIVE -eq 1 ]]; then
   for v in DOMAIN WGUI_USERNAME WGUI_PASSWORD EMAIL; do
     if [[ -z "${!v}" ]]; then
@@ -317,6 +342,8 @@ fi
 
 validate_domain "$DOMAIN" || { ui_err "${UI_RED}Dominio invalido: $DOMAIN${UI_NC}"; exit 2; }
 validate_email "$EMAIL"   || { ui_err "${UI_RED}Email invalido: $EMAIL${UI_NC}"; exit 2; }
+validate_port_list "$ECUADOR_TCP_PORTS" || { ui_err "${UI_RED}Lista TCP invalida (maximo 15 puertos): $ECUADOR_TCP_PORTS${UI_NC}"; exit 2; }
+validate_port_list "$ECUADOR_UDP_PORTS" || { ui_err "${UI_RED}Lista UDP invalida (maximo 15 puertos): $ECUADOR_UDP_PORTS${UI_NC}"; exit 2; }
 
 ui "Log: ${LOG_FILE}"
 : > "$LOG_FILE"
@@ -356,7 +383,7 @@ PKGS=(
   curl tar ca-certificates openssl bind9-dnsutils
   iproute2 iptables iptables-persistent
   wireguard wireguard-tools libcap2-bin
-  util-linux unattended-upgrades
+  util-linux unattended-upgrades ipset jq
 )
 if [[ "$OS_FAMILY" == "debian" ]] && ! systemctl is-active --quiet systemd-resolved; then
   PKGS+=(resolvconf)
@@ -671,6 +698,148 @@ EOF
 /usr/local/sbin/wg-firewall.sh apply
 netfilter-persistent save >/dev/null 2>&1 || true
 
+cat >/etc/default/wg-ecuador-acl <<EOF
+ECUADOR_TCP_PORTS="$ECUADOR_TCP_PORTS"
+ECUADOR_UDP_PORTS="$ECUADOR_UDP_PORTS"
+ECUADOR_ACL_URL="https://stat.ripe.net/data/country-resource-list/data.json?resource=EC&v4_format=prefix"
+EOF
+chmod 600 /etc/default/wg-ecuador-acl
+
+cat >/usr/local/sbin/wg-ecuador-acl.sh <<'EOF'
+#!/usr/bin/env bash
+set -eEuo pipefail
+. /etc/default/wg-ecuador-acl
+
+state_dir=/var/lib/wg-installer/ecuador-acl
+v4_file="$state_dir/ipv4.txt"
+v6_file="$state_dir/ipv6.txt"
+mode="${1:-update}"
+
+remove_input_jumps() {
+  local family="$1" chain="$2" line
+  while line=$("$family" -L INPUT --line-numbers -n | awk -v target="$chain" '$2 == target {print $1; exit}') && [[ -n "$line" ]]; do
+    "$family" -w -D INPUT "$line"
+  done
+}
+
+remove_rules() {
+  remove_input_jumps iptables WG_EC4
+  remove_input_jumps ip6tables WG_EC6
+  iptables -w -F WG_EC4 2>/dev/null || true
+  iptables -w -X WG_EC4 2>/dev/null || true
+  ip6tables -w -F WG_EC6 2>/dev/null || true
+  ip6tables -w -X WG_EC6 2>/dev/null || true
+}
+
+load_sets() {
+  local source_v4="$1" source_v6="$2"
+  ipset create ecuador_v4 hash:net family inet maxelem 20000 -exist
+  ipset create ecuador_v6 hash:net family inet6 maxelem 20000 -exist
+  ipset create ecuador_v4_new hash:net family inet maxelem 20000 -exist
+  ipset create ecuador_v6_new hash:net family inet6 maxelem 20000 -exist
+  ipset flush ecuador_v4_new
+  ipset flush ecuador_v6_new
+  awk '{print "add ecuador_v4_new " $0}' "$source_v4" | ipset restore
+  awk '{print "add ecuador_v6_new " $0}' "$source_v6" | ipset restore
+  ipset swap ecuador_v4_new ecuador_v4
+  ipset swap ecuador_v6_new ecuador_v6
+  ipset destroy ecuador_v4_new
+  ipset destroy ecuador_v6_new
+}
+
+apply_rules() {
+  remove_rules
+  iptables -w -N WG_EC4
+  ip6tables -w -N WG_EC6
+  iptables -w -A WG_EC4 -m set --match-set ecuador_v4 src -j ACCEPT
+  iptables -w -A WG_EC4 -j DROP
+  ip6tables -w -A WG_EC6 -m set --match-set ecuador_v6 src -j ACCEPT
+  ip6tables -w -A WG_EC6 -j DROP
+  if [[ -n "$ECUADOR_TCP_PORTS" ]]; then
+    iptables -w -I INPUT 1 -p tcp -m multiport --dports "$ECUADOR_TCP_PORTS" -j WG_EC4
+    ip6tables -w -I INPUT 1 -p tcp -m multiport --dports "$ECUADOR_TCP_PORTS" -j WG_EC6
+  fi
+  if [[ -n "$ECUADOR_UDP_PORTS" ]]; then
+    iptables -w -I INPUT 1 -p udp -m multiport --dports "$ECUADOR_UDP_PORTS" -j WG_EC4
+    ip6tables -w -I INPUT 1 -p udp -m multiport --dports "$ECUADOR_UDP_PORTS" -j WG_EC6
+  fi
+}
+
+if [[ "$mode" == --remove ]]; then
+  remove_rules
+  exit 0
+fi
+
+if [[ "$mode" == --sets-only ]]; then
+  [[ -s "$v4_file" && -s "$v6_file" ]]
+  load_sets "$v4_file" "$v6_file"
+  exit 0
+fi
+
+tmp_dir=$(mktemp -d)
+trap 'ipset destroy ecuador_v4_new 2>/dev/null || true; ipset destroy ecuador_v6_new 2>/dev/null || true; rm -rf "$tmp_dir"' EXIT
+curl --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 -fsSL "$ECUADOR_ACL_URL" -o "$tmp_dir/resources.json"
+jq -e '(.status == "ok") and ((.data.resource | ascii_upcase) == "EC")' "$tmp_dir/resources.json" >/dev/null
+jq -er '.data.resources.ipv4[]' "$tmp_dir/resources.json" | sort -u > "$tmp_dir/ipv4.txt"
+jq -er '.data.resources.ipv6[]' "$tmp_dir/resources.json" | sort -u > "$tmp_dir/ipv6.txt"
+! grep -qxF '0.0.0.0/0' "$tmp_dir/ipv4.txt"
+! grep -qxF '::/0' "$tmp_dir/ipv6.txt"
+v4_count=$(wc -l < "$tmp_dir/ipv4.txt")
+v6_count=$(wc -l < "$tmp_dir/ipv6.txt")
+(( v4_count >= 50 )) || { echo "Ecuador IPv4 list too small: $v4_count" >&2; exit 1; }
+(( v6_count >= 10 )) || { echo "Ecuador IPv6 list too small: $v6_count" >&2; exit 1; }
+load_sets "$tmp_dir/ipv4.txt" "$tmp_dir/ipv6.txt"
+install -d -m 700 "$state_dir"
+install -m 600 "$tmp_dir/ipv4.txt" "$v4_file"
+install -m 600 "$tmp_dir/ipv6.txt" "$v6_file"
+date -u +%Y-%m-%dT%H:%M:%SZ > "$state_dir/last-success"
+chmod 600 "$state_dir/last-success"
+apply_rules
+logger -t wg-ecuador-acl "Updated Ecuador ACL: $v4_count IPv4 prefixes, $v6_count IPv6 prefixes"
+EOF
+chmod 750 /usr/local/sbin/wg-ecuador-acl.sh
+
+cat >/etc/systemd/system/wg-ecuador-acl-sets.service <<'EOF'
+[Unit]
+Description=Restore Ecuador IP sets before persistent firewall rules
+DefaultDependencies=no
+After=local-fs.target
+Before=netfilter-persistent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wg-ecuador-acl.sh --sets-only
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat >/etc/systemd/system/wg-ecuador-acl.service <<'EOF'
+[Unit]
+Description=Update Ecuador IPv4 and IPv6 ACL sets
+Wants=network-online.target
+After=network-online.target wg-ecuador-acl-sets.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wg-ecuador-acl.sh update
+EOF
+
+cat >/etc/systemd/system/wg-ecuador-acl.timer <<'EOF'
+[Unit]
+Description=Daily update of Ecuador IP ACL sets
+
+[Timer]
+OnBootSec=10min
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
 cat >/etc/systemd/system/wg-quick-watcher@.path <<'EOF'
 [Unit]
 Description=Watch /etc/wireguard/%i.conf
@@ -718,6 +887,15 @@ ip link show wg0 >/dev/null 2>&1 || { logger -p daemon.err -t wg-health "wg0 is 
 [[ $(iptables -S FORWARD | grep -c -- '-i wg0 -j ACCEPT' || true) -eq 1 ]] || { logger -p daemon.err -t wg-health "unexpected IPv4 forwarding rule count"; failed=1; }
 [[ $(iptables -t nat -S POSTROUTING | grep -c -- '-s 172.30.0.0/24 .* -j MASQUERADE' || true) -eq 1 ]] || { logger -p daemon.err -t wg-health "unexpected IPv4 NAT rule count"; failed=1; }
 [[ $(ip6tables -t nat -S POSTROUTING | grep -c -- "^-A POSTROUTING -o .* -j MASQUERADE$" || true) -eq 0 ]] || { logger -p daemon.err -t wg-health "unsafe legacy NAT66 rule detected"; failed=1; }
+if [[ -r /etc/default/wg-ecuador-acl ]]; then
+  . /etc/default/wg-ecuador-acl
+  if [[ -n "${ECUADOR_TCP_PORTS:-}" || -n "${ECUADOR_UDP_PORTS:-}" ]]; then
+    systemctl is-active --quiet wg-ecuador-acl.timer || { logger -p daemon.err -t wg-health "Ecuador ACL timer is not active"; failed=1; }
+    [[ $(ipset list ecuador_v4 2>/dev/null | awk '/Number of entries:/ {print $4}') -ge 50 ]] || { logger -p daemon.err -t wg-health "Ecuador IPv4 set is missing or too small"; failed=1; }
+    [[ $(ipset list ecuador_v6 2>/dev/null | awk '/Number of entries:/ {print $4}') -ge 10 ]] || { logger -p daemon.err -t wg-health "Ecuador IPv6 set is missing or too small"; failed=1; }
+    find /var/lib/wg-installer/ecuador-acl/last-success -mmin -2880 -print -quit 2>/dev/null | grep -q . || { logger -p daemon.err -t wg-health "Ecuador ACL has not updated successfully in 48 hours"; failed=1; }
+  fi
+fi
 exit "$failed"
 EOF
 chmod 750 /usr/local/sbin/wg-health-check.sh
@@ -750,6 +928,7 @@ install -d -m 700 "$dest"
 umask 077
 tar -czf "$dest/config-${stamp}.tar.gz" \
   /etc/wireguard /etc/default/wireguard-ui /etc/default/wg-firewall \
+  /etc/default/wg-ecuador-acl \
   /etc/caddy /etc/iptables /etc/systemd/system/wg-*.service \
   /etc/systemd/system/wg-*.timer /etc/systemd/system/wg-*.path \
   /etc/systemd/system/wireguard-ui.service /etc/systemd/system/caddy.service \
@@ -780,6 +959,14 @@ ui_step "Iniciando servicios"
 systemctl daemon-reload
 systemctl enable --now wireguard-ui caddy wg-firewall.service \
   wg-quick-watcher@wg0.path wg-health.timer wg-backup.timer
+if [[ -n "$ECUADOR_TCP_PORTS" || -n "$ECUADOR_UDP_PORTS" ]]; then
+  /usr/local/sbin/wg-ecuador-acl.sh update
+  systemctl enable --now wg-ecuador-acl-sets.service wg-ecuador-acl.timer
+else
+  /usr/local/sbin/wg-ecuador-acl.sh --remove
+  systemctl disable --now wg-ecuador-acl.timer wg-ecuador-acl-sets.service 2>/dev/null || true
+fi
+netfilter-persistent save >/dev/null 2>&1 || true
 systemctl enable wg-quick@wg0 >/dev/null 2>&1 || true
 /usr/local/sbin/wg-config-backup.sh
 
