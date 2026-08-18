@@ -173,7 +173,6 @@ do_uninstall() {
 
   netfilter-persistent save >/dev/null 2>&1 || true
   ipset destroy ecuador_v4 2>/dev/null || true
-  ipset destroy ecuador_v6 2>/dev/null || true
   ui "${UI_GREEN}Desinstalacion completada.${UI_NC}"
   exit 0
 }
@@ -712,7 +711,6 @@ set -eEuo pipefail
 
 state_dir=/var/lib/wg-installer/ecuador-acl
 v4_file="$state_dir/ipv4.txt"
-v6_file="$state_dir/ipv6.txt"
 mode="${1:-update}"
 
 remove_input_jumps() {
@@ -724,44 +722,30 @@ remove_input_jumps() {
 
 remove_rules() {
   remove_input_jumps iptables WG_EC4
-  remove_input_jumps ip6tables WG_EC6
   iptables -w -F WG_EC4 2>/dev/null || true
   iptables -w -X WG_EC4 2>/dev/null || true
-  ip6tables -w -F WG_EC6 2>/dev/null || true
-  ip6tables -w -X WG_EC6 2>/dev/null || true
 }
 
 load_sets() {
-  local source_v4="$1" source_v6="$2"
+  local source_v4="$1"
   ipset create ecuador_v4 hash:net family inet maxelem 20000 -exist
-  ipset create ecuador_v6 hash:net family inet6 maxelem 20000 -exist
   ipset create ecuador_v4_new hash:net family inet maxelem 20000 -exist
-  ipset create ecuador_v6_new hash:net family inet6 maxelem 20000 -exist
   ipset flush ecuador_v4_new
-  ipset flush ecuador_v6_new
   awk '{print "add ecuador_v4_new " $0}' "$source_v4" | ipset restore
-  awk '{print "add ecuador_v6_new " $0}' "$source_v6" | ipset restore
   ipset swap ecuador_v4_new ecuador_v4
-  ipset swap ecuador_v6_new ecuador_v6
   ipset destroy ecuador_v4_new
-  ipset destroy ecuador_v6_new
 }
 
 apply_rules() {
   remove_rules
   iptables -w -N WG_EC4
-  ip6tables -w -N WG_EC6
   iptables -w -A WG_EC4 -m set --match-set ecuador_v4 src -j ACCEPT
   iptables -w -A WG_EC4 -j DROP
-  ip6tables -w -A WG_EC6 -m set --match-set ecuador_v6 src -j ACCEPT
-  ip6tables -w -A WG_EC6 -j DROP
   if [[ -n "$ECUADOR_TCP_PORTS" ]]; then
     iptables -w -I INPUT 1 -p tcp -m multiport --dports "$ECUADOR_TCP_PORTS" -j WG_EC4
-    ip6tables -w -I INPUT 1 -p tcp -m multiport --dports "$ECUADOR_TCP_PORTS" -j WG_EC6
   fi
   if [[ -n "$ECUADOR_UDP_PORTS" ]]; then
     iptables -w -I INPUT 1 -p udp -m multiport --dports "$ECUADOR_UDP_PORTS" -j WG_EC4
-    ip6tables -w -I INPUT 1 -p udp -m multiport --dports "$ECUADOR_UDP_PORTS" -j WG_EC6
   fi
 }
 
@@ -771,31 +755,26 @@ if [[ "$mode" == --remove ]]; then
 fi
 
 if [[ "$mode" == --sets-only ]]; then
-  [[ -s "$v4_file" && -s "$v6_file" ]]
-  load_sets "$v4_file" "$v6_file"
+  [[ -s "$v4_file" ]]
+  load_sets "$v4_file"
   exit 0
 fi
 
 tmp_dir=$(mktemp -d)
-trap 'ipset destroy ecuador_v4_new 2>/dev/null || true; ipset destroy ecuador_v6_new 2>/dev/null || true; rm -rf "$tmp_dir"' EXIT
+trap 'ipset destroy ecuador_v4_new 2>/dev/null || true; rm -rf "$tmp_dir"' EXIT
 curl --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 -fsSL "$ECUADOR_ACL_URL" -o "$tmp_dir/resources.json"
 jq -e '(.status == "ok") and ((.data.resource | ascii_upcase) == "EC")' "$tmp_dir/resources.json" >/dev/null
 jq -er '.data.resources.ipv4[]' "$tmp_dir/resources.json" | sort -u > "$tmp_dir/ipv4.txt"
-jq -er '.data.resources.ipv6[]' "$tmp_dir/resources.json" | sort -u > "$tmp_dir/ipv6.txt"
 ! grep -qxF '0.0.0.0/0' "$tmp_dir/ipv4.txt"
-! grep -qxF '::/0' "$tmp_dir/ipv6.txt"
 v4_count=$(wc -l < "$tmp_dir/ipv4.txt")
-v6_count=$(wc -l < "$tmp_dir/ipv6.txt")
 (( v4_count >= 50 )) || { echo "Ecuador IPv4 list too small: $v4_count" >&2; exit 1; }
-(( v6_count >= 10 )) || { echo "Ecuador IPv6 list too small: $v6_count" >&2; exit 1; }
-load_sets "$tmp_dir/ipv4.txt" "$tmp_dir/ipv6.txt"
+load_sets "$tmp_dir/ipv4.txt"
 install -d -m 700 "$state_dir"
 install -m 600 "$tmp_dir/ipv4.txt" "$v4_file"
-install -m 600 "$tmp_dir/ipv6.txt" "$v6_file"
 date -u +%Y-%m-%dT%H:%M:%SZ > "$state_dir/last-success"
 chmod 600 "$state_dir/last-success"
 apply_rules
-logger -t wg-ecuador-acl "Updated Ecuador ACL: $v4_count IPv4 prefixes, $v6_count IPv6 prefixes"
+logger -t wg-ecuador-acl "Updated Ecuador ACL: $v4_count IPv4 prefixes"
 EOF
 chmod 750 /usr/local/sbin/wg-ecuador-acl.sh
 
@@ -892,7 +871,6 @@ if [[ -r /etc/default/wg-ecuador-acl ]]; then
   if [[ -n "${ECUADOR_TCP_PORTS:-}" || -n "${ECUADOR_UDP_PORTS:-}" ]]; then
     systemctl is-active --quiet wg-ecuador-acl.timer || { logger -p daemon.err -t wg-health "Ecuador ACL timer is not active"; failed=1; }
     [[ $(ipset list ecuador_v4 2>/dev/null | awk '/Number of entries:/ {print $4}') -ge 50 ]] || { logger -p daemon.err -t wg-health "Ecuador IPv4 set is missing or too small"; failed=1; }
-    [[ $(ipset list ecuador_v6 2>/dev/null | awk '/Number of entries:/ {print $4}') -ge 10 ]] || { logger -p daemon.err -t wg-health "Ecuador IPv6 set is missing or too small"; failed=1; }
     find /var/lib/wg-installer/ecuador-acl/last-success -mmin -2880 -print -quit 2>/dev/null | grep -q . || { logger -p daemon.err -t wg-health "Ecuador ACL has not updated successfully in 48 hours"; failed=1; }
   fi
 fi
