@@ -807,11 +807,11 @@ EOF
 
 cat >/etc/systemd/system/wg-ecuador-acl.timer <<'EOF'
 [Unit]
-Description=Daily update of Ecuador IP ACL sets
+Description=Update Ecuador IPv4 ACL set every 30 days
 
 [Timer]
 OnBootSec=10min
-OnCalendar=daily
+OnUnitActiveSec=30d
 RandomizedDelaySec=1h
 Persistent=true
 
@@ -871,7 +871,7 @@ if [[ -r /etc/default/wg-ecuador-acl ]]; then
   if [[ -n "${ECUADOR_TCP_PORTS:-}" || -n "${ECUADOR_UDP_PORTS:-}" ]]; then
     systemctl is-active --quiet wg-ecuador-acl.timer || { logger -p daemon.err -t wg-health "Ecuador ACL timer is not active"; failed=1; }
     [[ $(ipset list ecuador_v4 2>/dev/null | awk '/Number of entries:/ {print $4}') -ge 50 ]] || { logger -p daemon.err -t wg-health "Ecuador IPv4 set is missing or too small"; failed=1; }
-    find /var/lib/wg-installer/ecuador-acl/last-success -mmin -2880 -print -quit 2>/dev/null | grep -q . || { logger -p daemon.err -t wg-health "Ecuador ACL has not updated successfully in 48 hours"; failed=1; }
+    find /var/lib/wg-installer/ecuador-acl/last-success -mmin -50400 -print -quit 2>/dev/null | grep -q . || { logger -p daemon.err -t wg-health "Ecuador ACL has not updated successfully in 35 days"; failed=1; }
   fi
 fi
 exit "$failed"

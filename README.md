@@ -32,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/mtandazo35/wg-installer/main/instal
 - **Migración segura**: elimina reglas NAT66 globales creadas por versiones anteriores y las reemplaza por una regla limitada al CIDR de la VPN.
 - **Aplicación segura**: el watcher valida `wg0.conf` antes de reiniciar y no modifica el archivo generado por WireGuard-UI.
 - **Operación automática**: health check cada cinco minutos, respaldos diarios con retención de 14 días y actualizaciones de seguridad automáticas.
-- **ACL Ecuador IPv4 opcional**: restringe puertos TCP/UDP a prefijos IPv4 ecuatorianos y actualiza la lista diariamente desde RIPEstat.
+- **ACL Ecuador IPv4 opcional**: restringe puertos TCP/UDP a prefijos IPv4 ecuatorianos y actualiza la lista cada 30 días desde RIPEstat.
 - **Uninstall** restaura iptables previos.
 
 ## Requisitos
@@ -111,7 +111,7 @@ Unidades systemd creadas:
 - `wg-quick-watcher@wg0.path` + `@.service` — valida y aplica cambios de `wg0.conf`
 - `wg-health.timer` — verifica servicios, interfaz, disco y reglas cada cinco minutos
 - `wg-backup.timer` — crea un respaldo root-only diario y conserva 14 días
-- `wg-ecuador-acl.timer` — actualiza diariamente los prefijos de Ecuador
+- `wg-ecuador-acl.timer` — actualiza los prefijos de Ecuador cada 30 días
 
 ## Red / NAT
 
@@ -130,7 +130,7 @@ sudo ./install.sh \
   --ecuador-udp-ports 9000
 ```
 
-El instalador crea el conjunto atómico `ecuador_v4`, descarga los prefijos IPv4 desde la API Country Resource List de RIPEstat y programa una actualización diaria. Antes de reemplazar la lista activa exige al menos 50 prefijos; una descarga vacía, incompleta o inválida no reemplaza la última lista válida.
+El instalador crea el conjunto atómico `ecuador_v4`, descarga los prefijos IPv4 desde la API Country Resource List de RIPEstat y programa una actualización cada 30 días. Antes de reemplazar la lista activa exige al menos 50 prefijos; una descarga vacía, incompleta o inválida no reemplaza la última lista válida.
 
 Las reglas solo afectan a los puertos indicados. No incluyas `51820/UDP` salvo que quieras permitir conexiones WireGuard exclusivamente desde Ecuador. La clasificación se basa en asignaciones de los registros regionales, no en la ubicación física exacta de cada usuario; VPN, roaming, CDN o transferencias recientes pueden producir excepciones.
 
